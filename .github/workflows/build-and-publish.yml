@@ -3,31 +3,32 @@ on:
   workflow_dispatch:
     inputs:
       package_name:
-        description: "Package Name (ex.: fastfetch-pytuna)"
+        description: "Package Name"
         required: true
         type: string
 jobs:
   build:
+    name: Building package
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout pytuna-repo (this repo)
+      - name: Checkout repository (this repo)
         uses: actions/checkout@v4
         with:
-          path: pytuna-repo
-      - name: Checkout pytuna-packages (public, read-only)
+          path: repository
+      - name: Checkout packages repository
         uses: actions/checkout@v4
         with:
-          repository: askell091/pytuna-packages
-          path: pytuna-packages
+          repository: pytunaOS/packages
+          path: packages
       - name: Validate package folder exists
         run: |
-          if [ ! -d "pytuna-packages/${{ inputs.package_name }}" ]; then
-            echo "::error::Pasta '${{ inputs.package_name }}' não encontrada em pytuna-packages"
+          if [ ! -d "packages/${{ inputs.package_name }}" ]; then
+            echo "::error::Pasta '${{ inputs.package_name }}' não encontrada em packages"
             exit 1
           fi
-          if [ ! -f "pytuna-packages/${{ inputs.package_name }}/PKGBUILD" ]; then
+          if [ ! -f "packages/${{ inputs.package_name }}/PKGBUILD" ]; then
             echo "::error::PKGBUILD não encontrado em ${{ inputs.package_name }}"
             exit 1
           fi
@@ -36,7 +37,7 @@ jobs:
       - name: Build package with makepkg
         run: |
           docker run --rm \
-            -v "${{ github.workspace }}/pytuna-packages/${{ inputs.package_name }}:/pkgbuild" \
+            -v "${{ github.workspace }}/packages/${{ inputs.package_name }}:/pkgbuild" \
             -w /pkgbuild \
             archlinux:latest \
             bash -c '
@@ -51,7 +52,7 @@ jobs:
       - name: Locate built package
         id: locate
         run: |
-          PKG_FILE=$(find "pytuna-packages/${{ inputs.package_name }}" -maxdepth 1 -name "*.pkg.tar.zst" | head -n1)
+          PKG_FILE=$(find "packages/${{ inputs.package_name }}" -maxdepth 1 -name "*.pkg.tar.zst" | head -n1)
           if [ -z "$PKG_FILE" ]; then
             echo "::error::Nenhum arquivo .pkg.tar.zst foi gerado"
             exit 1
@@ -60,12 +61,12 @@ jobs:
           echo "pkg_basename=$(basename "$PKG_FILE")" >> "$GITHUB_OUTPUT"
       - name: Copy package into repo pool
         run: |
-          mkdir -p pytuna-repo/x86_64
-          cp "${{ steps.locate.outputs.pkg_file }}" "pytuna-repo/x86_64/"
+          mkdir -p repository/x86_64
+          cp "${{ steps.locate.outputs.pkg_file }}" "repository/x86_64/"
       - name: Sign package and update pacman database with repo-add
         run: |
           docker run --rm \
-            -v "${{ github.workspace }}/pytuna-repo:/repo" \
+            -v "${{ github.workspace }}/repository:/repo" \
             -e GPG_PRIVATE_KEY="${{ secrets.GPG_PRIVATE_KEY }}" \
             -e GPG_FINGERPRINT="${{ secrets.GPG_FINGERPRINT }}" \
             -e GPG_PASSPHRASE="${{ secrets.GPG_PASSPHRASE }}" \
@@ -87,10 +88,10 @@ jobs:
                 --detach-sign "$PKG"
 
               repo-add --sign --key "$GPG_FINGERPRINT" \
-                pytuna.db.tar.gz "$PKG"
+                x86_64/pytuna.db.tar.gz "$PKG"
             '
       - name: Replace symlinks with real files
-        working-directory: pytuna-repo
+        working-directory: repository/x86_64
         run: |
           for link in pytuna.db pytuna.files pytuna.db.sig pytuna.files.sig; do
             if [ -L "$link" ]; then
@@ -100,12 +101,11 @@ jobs:
               echo "Resolvido: $link -> cópia real de $target"
             fi
           done
-      - name: Commit and push to pytuna-repo
-        working-directory: pytuna-repo
+      - name: Commit and push to repository
+        working-directory: repository
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add x86_64/ pytuna.db.tar.gz pytuna.files.tar.gz pytuna.db pytuna.files pytuna.db.sig pytuna.files.sig 2>/dev/null || true
-          git add x86_64/ pytuna.db.tar.gz pytuna.files.tar.gz pytuna.db pytuna.files
+          git add x86_64
           git commit -m "Update ${{ inputs.package_name }} (${{ steps.locate.outputs.pkg_basename }})" || echo "Nada para commitar"
           git push origin HEAD
