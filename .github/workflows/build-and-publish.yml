@@ -1,14 +1,22 @@
-name: Build and Publish Package
+name: Manage Package Repository
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: "What to do"
+        required: true
+        type: choice
+        options:
+          - build
+          - remove
+        default: build
       package_name:
-        description: "Package Name"
+        description: "Package name (ex.: fastfetch-pytuna)"
         required: true
         type: string
 jobs:
-  build:
-    name: Building package
+  manage:
+    name: ${{ inputs.action == 'build' && 'Building package' || 'Removing package' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,12 +25,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: repository
+
       - name: Checkout packages repository
+        if: inputs.action == 'build'
         uses: actions/checkout@v4
         with:
           repository: pytunaOS/packages
           path: packages
+
       - name: Validate package folder exists
+        if: inputs.action == 'build'
         run: |
           if [ ! -d "packages/${{ inputs.package_name }}" ]; then
             echo "::error::Pasta '${{ inputs.package_name }}' não encontrada em packages"
@@ -32,9 +44,12 @@ jobs:
             echo "::error::PKGBUILD não encontrado em ${{ inputs.package_name }}"
             exit 1
           fi
+
       - name: Pull Arch Linux container
         run: docker pull archlinux:latest
+
       - name: Build package with makepkg
+        if: inputs.action == 'build'
         run: |
           docker run --rm \
             -v "${{ github.workspace }}/packages/${{ inputs.package_name }}:/pkgbuild" \
@@ -42,6 +57,14 @@ jobs:
             archlinux:latest \
             bash -c '
               set -euo pipefail
+              pacman-key --init
+              pacman-key --populate archlinux
+              pacman-key --recv-key D6C309C08D61B59ABED5D9D1D4FE3B0C197EF8C6 --keyserver hkps://keyserver.ubuntu.com
+              pacman-key --lsign-key D6C309C08D61B59ABED5D9D1D4FE3B0C197EF8C6
+              pacman -U https://raw.githubusercontent.com/pytunaOS/repository/main/x86_64/pytuna-keyring-20260806-1-any.pkg.tar.zst --noconfirm
+              pacman -U https://raw.githubusercontent.com/pytunaOS/repository/main/x86_64/pytuna-mirrorlist-20260806-1-any.pkg.tar.zst --noconfirm
+              echo "[pytuna]" >> /etc/pacman.conf
+              echo "Include = /etc/pacman.d/pytuna-mirrorlist" >> /etc/pacman.conf
               pacman -Syu --noconfirm
               pacman -S --noconfirm base-devel sudo git
               useradd -m builder
@@ -49,8 +72,10 @@ jobs:
               echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
               su builder -c "cd /pkgbuild && makepkg -s --noconfirm --needed"
             '
+
       - name: Locate built package
         id: locate
+        if: inputs.action == 'build'
         run: |
           PKG_FILE=$(find "packages/${{ inputs.package_name }}" -maxdepth 1 -name "*.pkg.tar.zst" | head -n1)
           if [ -z "$PKG_FILE" ]; then
@@ -59,11 +84,15 @@ jobs:
           fi
           echo "pkg_file=$PKG_FILE" >> "$GITHUB_OUTPUT"
           echo "pkg_basename=$(basename "$PKG_FILE")" >> "$GITHUB_OUTPUT"
+
       - name: Copy package into repo pool
+        if: inputs.action == 'build'
         run: |
           mkdir -p repository/x86_64
           cp "${{ steps.locate.outputs.pkg_file }}" "repository/x86_64/"
+
       - name: Sign package and update pacman database with repo-add
+        if: inputs.action == 'build'
         run: |
           docker run --rm \
             -v "${{ github.workspace }}/repository:/repo" \
@@ -87,9 +116,83 @@ jobs:
                 --default-key "$GPG_FINGERPRINT" \
                 --detach-sign "$PKG"
 
-              repo-add --sign --key "$GPG_FINGERPRINT" \
+              # Não usar --sign aqui: repo-add chama gpg sem --pinentry-mode
+              # loopback, o que pode falhar silenciosamente (só warning) em
+              # ambiente não interativo. Assina-se manualmente depois.
+              repo-add --key "$GPG_FINGERPRINT" --remove \
                 x86_64/pytuna.db.tar.gz "$PKG"
+
+              rm -f x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.files.tar.gz.sig
+
+              gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" --default-key "$GPG_FINGERPRINT" \
+                --detach-sign --output x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.db.tar.gz
+
+              gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" --default-key "$GPG_FINGERPRINT" \
+                --detach-sign --output x86_64/pytuna.files.tar.gz.sig x86_64/pytuna.files.tar.gz
+
+              echo "==> Verificando assinatura do banco após repo-add..."
+              gpg --verify x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.db.tar.gz
+              gpg --verify x86_64/pytuna.files.tar.gz.sig x86_64/pytuna.files.tar.gz
+
+              rm -f x86_64/*.old x86_64/*.old.sig
             '
+
+      - name: Remove from pacman database with repo-remove
+        if: inputs.action == 'remove'
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/repository:/repo" \
+            -e GPG_PRIVATE_KEY="${{ secrets.GPG_PRIVATE_KEY }}" \
+            -e GPG_FINGERPRINT="${{ secrets.GPG_FINGERPRINT }}" \
+            -e GPG_PASSPHRASE="${{ secrets.GPG_PASSPHRASE }}" \
+            -w /repo \
+            archlinux:latest \
+            bash -c '
+              set -euo pipefail
+              pacman -Syu --noconfirm
+              pacman -S --noconfirm pacman-contrib gnupg
+
+              pacman-key --init
+              pacman-key --populate archlinux
+
+              echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+              echo "${GPG_FINGERPRINT}:6:" | gpg --import-ownertrust
+
+              # Não usar --sign aqui: repo-remove/repo-add chamam gpg sem
+              # --pinentry-mode loopback, o que falha silenciosamente (só warning)
+              # em ambiente não interativo como o CI. Assina-se manualmente depois.
+              repo-remove --key "$GPG_FINGERPRINT" --remove \
+                x86_64/pytuna.db.tar.gz "${{ inputs.package_name }}"
+
+              rm -f x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.files.tar.gz.sig
+
+              gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" --default-key "$GPG_FINGERPRINT" \
+                --detach-sign --output x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.db.tar.gz
+
+              gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" --default-key "$GPG_FINGERPRINT" \
+                --detach-sign --output x86_64/pytuna.files.tar.gz.sig x86_64/pytuna.files.tar.gz
+
+              echo "==> Verificando assinatura do banco após repo-remove..."
+              gpg --verify x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.db.tar.gz
+              gpg --verify x86_64/pytuna.files.tar.gz.sig x86_64/pytuna.files.tar.gz
+
+              rm -f x86_64/*.old x86_64/*.old.sig
+            '
+
+      - name: Remove leftover package files from disk
+        if: inputs.action == 'remove'
+        working-directory: repository/x86_64
+        run: |
+          shopt -s nullglob
+          for f in "${{ inputs.package_name }}"-*.pkg.tar.zst "${{ inputs.package_name }}"-*.pkg.tar.zst.sig; do
+            echo "Removendo arquivo órfão: $f"
+            rm -f "$f"
+          done
+
       - name: Replace symlinks with real files
         working-directory: repository/x86_64
         run: |
@@ -101,11 +204,26 @@ jobs:
               echo "Resolvido: $link -> cópia real de $target"
             fi
           done
+
+      - name: Verify final db/sig pair before commit
+        working-directory: repository/x86_64
+        run: |
+          gpg --import <(echo "${{ secrets.GPG_PRIVATE_KEY }}") 2>/dev/null || true
+          echo "${{ secrets.GPG_FINGERPRINT }}:6:" | gpg --import-ownertrust 2>/dev/null || true
+          echo "==> Verificação final antes do commit..."
+          gpg --verify pytuna.db.tar.gz.sig pytuna.db.tar.gz
+          gpg --verify pytuna.files.tar.gz.sig pytuna.files.tar.gz
+
       - name: Commit and push to repository
         working-directory: repository
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add x86_64
-          git commit -m "Update ${{ inputs.package_name }} (${{ steps.locate.outputs.pkg_basename }})" || echo "Nada para commitar"
+          if [ "${{ inputs.action }}" = "build" ]; then
+            MSG="Update ${{ inputs.package_name }} (${{ steps.locate.outputs.pkg_basename }})"
+          else
+            MSG="Remove ${{ inputs.package_name }} from repository"
+          fi
+          git commit -m "$MSG" || echo "Nada para commitar"
           git push origin HEAD
