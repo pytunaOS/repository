@@ -57,6 +57,8 @@ jobs:
             archlinux:latest \
             bash -c '
               set -euo pipefail
+              export LANG=C.UTF-8
+              export LC_ALL=C.UTF-8
               pacman-key --init
               pacman-key --populate archlinux
               # pytuna repository
