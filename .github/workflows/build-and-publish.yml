@@ -71,6 +71,7 @@ jobs:
 
           docker run --rm \
             -v "${{ github.workspace }}/packages/${{ inputs.package_name }}:/pkgbuild" \
+            -v "${{ github.workspace }}/repository/x86_64:/pytuna-repository:ro" \
             -w /pkgbuild \
             archlinux:latest \
             bash -c '
@@ -89,13 +90,39 @@ jobs:
 
               pacman-key --lsign-key D4FE3B0C197EF8C6
 
-              pacman -U \
-                "https://raw.githubusercontent.com/pytunaOS/repository/main/x86_64/pytuna-keyring-20260806-1-any.pkg.tar.zst" \
-                --noconfirm
+              KEYRING_PACKAGE="$(
+                find /pytuna-repository \
+                  -maxdepth 1 \
+                  -type f \
+                  -name "pytuna-keyring-*.pkg.tar.zst" |
+                  sort -V |
+                  tail -n 1
+              )"
 
-              pacman -U \
-                "https://raw.githubusercontent.com/pytunaOS/repository/main/x86_64/pytuna-mirrorlist-20260806-1-any.pkg.tar.zst" \
-                --noconfirm
+              MIRRORLIST_PACKAGE="$(
+                find /pytuna-repository \
+                  -maxdepth 1 \
+                  -type f \
+                  -name "pytuna-mirrorlist-*.pkg.tar.zst" |
+                  sort -V |
+                  tail -n 1
+              )"
+
+              if [ -z "$KEYRING_PACKAGE" ]; then
+                echo "ERRO: pacote pytuna-keyring não encontrado no repositório"
+                exit 1
+              fi
+
+              if [ -z "$MIRRORLIST_PACKAGE" ]; then
+                echo "ERRO: pacote pytuna-mirrorlist não encontrado no repositório"
+                exit 1
+              fi
+
+              echo "Instalando bootstrap: $(basename "$KEYRING_PACKAGE")"
+              pacman -U --noconfirm "$KEYRING_PACKAGE"
+
+              echo "Instalando bootstrap: $(basename "$MIRRORLIST_PACKAGE")"
+              pacman -U --noconfirm "$MIRRORLIST_PACKAGE"
 
               printf "\n[pytuna]\n" >> /etc/pacman.conf
               printf "Include = /etc/pacman.d/pytuna-mirrorlist\n" \
