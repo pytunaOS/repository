@@ -1,4 +1,5 @@
 name: Manage Package Repository
+
 on:
   workflow_dispatch:
     inputs:
@@ -10,16 +11,24 @@ on:
           - build
           - remove
         default: build
+
       package_name:
-        description: "Package name (ex.: fastfetch-pytuna)"
+        description: "Package name"
         required: true
         type: string
+
+concurrency:
+  group: pytuna-package-repository
+  cancel-in-progress: false
+
 jobs:
   manage:
     name: ${{ inputs.action == 'build' && 'Building package' || 'Removing package' }}
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
+
     steps:
       - name: Checkout repository (this repo)
         uses: actions/checkout@v4
@@ -35,12 +44,18 @@ jobs:
 
       - name: Validate package folder exists
         if: inputs.action == 'build'
+        shell: bash
         run: |
-          if [ ! -d "packages/${{ inputs.package_name }}" ]; then
+          set -euo pipefail
+
+          PACKAGE_DIRECTORY="packages/${{ inputs.package_name }}"
+
+          if [ ! -d "$PACKAGE_DIRECTORY" ]; then
             echo "::error::Pasta '${{ inputs.package_name }}' não encontrada em packages"
             exit 1
           fi
-          if [ ! -f "packages/${{ inputs.package_name }}/PKGBUILD" ]; then
+
+          if [ ! -f "${PACKAGE_DIRECTORY}/PKGBUILD" ]; then
             echo "::error::PKGBUILD não encontrado em ${{ inputs.package_name }}"
             exit 1
           fi
@@ -50,60 +65,115 @@ jobs:
 
       - name: Build package with makepkg
         if: inputs.action == 'build'
+        shell: bash
         run: |
+          set -euo pipefail
+
           docker run --rm \
             -v "${{ github.workspace }}/packages/${{ inputs.package_name }}:/pkgbuild" \
             -w /pkgbuild \
             archlinux:latest \
             bash -c '
               set -euo pipefail
+
               export LANG=C.UTF-8
               export LC_ALL=C.UTF-8
+
               pacman-key --init
               pacman-key --populate archlinux
+
               # pytuna repository
-              pacman-key --recv-key D4FE3B0C197EF8C6 --keyserver hkps://keyserver.ubuntu.com
+              pacman-key \
+                --recv-key D4FE3B0C197EF8C6 \
+                --keyserver hkps://keyserver.ubuntu.com
+
               pacman-key --lsign-key D4FE3B0C197EF8C6
-              pacman -U https://raw.githubusercontent.com/pytunaOS/repository/main/x86_64/pytuna-keyring-20260806-1-any.pkg.tar.zst --noconfirm
-              pacman -U https://raw.githubusercontent.com/pytunaOS/repository/main/x86_64/pytuna-mirrorlist-20260806-1-any.pkg.tar.zst --noconfirm
-              echo "[pytuna]" >> /etc/pacman.conf
-              echo "Include = /etc/pacman.d/pytuna-mirrorlist" >> /etc/pacman.conf
+
+              pacman -U \
+                "https://raw.githubusercontent.com/pytunaOS/repository/main/x86_64/pytuna-keyring-20260806-1-any.pkg.tar.zst" \
+                --noconfirm
+
+              pacman -U \
+                "https://raw.githubusercontent.com/pytunaOS/repository/main/x86_64/pytuna-mirrorlist-20260806-1-any.pkg.tar.zst" \
+                --noconfirm
+
+              printf "\n[pytuna]\n" >> /etc/pacman.conf
+              printf "Include = /etc/pacman.d/pytuna-mirrorlist\n" \
+                >> /etc/pacman.conf
+
               # chaotic-aur repository
-              pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com
+              pacman-key \
+                --recv-key 3056513887B78AEB \
+                --keyserver hkps://keyserver.ubuntu.com
+
               pacman-key --lsign-key 3056513887B78AEB
-              pacman -U 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst' --noconfirm
-              pacman -U 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst' --noconfirm
-              echo "[chaotic-aur]" >> /etc/pacman.conf
-              echo "Include = /etc/pacman.d/chaotic-mirrorlist" >> /etc/pacman.conf
+
+              pacman -U \
+                "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst" \
+                --noconfirm
+
+              pacman -U \
+                "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst" \
+                --noconfirm
+
+              printf "\n[chaotic-aur]\n" >> /etc/pacman.conf
+              printf "Include = /etc/pacman.d/chaotic-mirrorlist\n" \
+                >> /etc/pacman.conf
+
               pacman -Syu --noconfirm
               pacman -S --noconfirm base-devel sudo git
-              useradd -m builder
+
+              useradd --create-home builder
               chown -R builder:builder /pkgbuild
-              echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-              su builder -c "cd /pkgbuild && makepkg -s --noconfirm --needed"
+
+              echo "builder ALL=(ALL) NOPASSWD: ALL" \
+                >> /etc/sudoers
+
+              su builder -c \
+                "cd /pkgbuild && makepkg -s --noconfirm --needed"
             '
 
       - name: Locate built package
         id: locate
         if: inputs.action == 'build'
+        shell: bash
         run: |
-          PKG_FILE=$(find "packages/${{ inputs.package_name }}" -maxdepth 1 -name "*.pkg.tar.zst" | head -n1)
+          set -euo pipefail
+
+          PKG_FILE="$(
+            find "packages/${{ inputs.package_name }}" \
+              -maxdepth 1 \
+              -type f \
+              -name "*.pkg.tar.zst" |
+              head -n1
+          )"
+
           if [ -z "$PKG_FILE" ]; then
             echo "::error::Nenhum arquivo .pkg.tar.zst foi gerado"
             exit 1
           fi
+
           echo "pkg_file=$PKG_FILE" >> "$GITHUB_OUTPUT"
           echo "pkg_basename=$(basename "$PKG_FILE")" >> "$GITHUB_OUTPUT"
 
       - name: Copy package into repo pool
         if: inputs.action == 'build'
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p repository/x86_64
-          cp "${{ steps.locate.outputs.pkg_file }}" "repository/x86_64/"
+
+          cp -- \
+            "${{ steps.locate.outputs.pkg_file }}" \
+            "repository/x86_64/"
 
       - name: Sign package and update pacman database with repo-add
         if: inputs.action == 'build'
+        shell: bash
         run: |
+          set -euo pipefail
+
           docker run --rm \
             -v "${{ github.workspace }}/repository:/repo" \
             -e GPG_PRIVATE_KEY="${{ secrets.GPG_PRIVATE_KEY }}" \
@@ -113,42 +183,75 @@ jobs:
             archlinux:latest \
             bash -c '
               set -euo pipefail
+
               pacman -Syu --noconfirm
               pacman -S --noconfirm pacman-contrib gnupg
 
-              echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-              echo "${GPG_FINGERPRINT}:6:" | gpg --import-ownertrust
+              printf "%s\n" "$GPG_PRIVATE_KEY" |
+                gpg --batch --import
+
+              printf "%s:6:\n" "$GPG_FINGERPRINT" |
+                gpg --import-ownertrust
 
               PKG="x86_64/${{ steps.locate.outputs.pkg_basename }}"
 
-              gpg --batch --yes --pinentry-mode loopback \
+              gpg \
+                --batch \
+                --yes \
+                --pinentry-mode loopback \
                 --passphrase "$GPG_PASSPHRASE" \
                 --default-key "$GPG_FINGERPRINT" \
                 --detach-sign "$PKG"
 
-              repo-add --key "$GPG_FINGERPRINT" --remove \
-                x86_64/pytuna.db.tar.gz "$PKG"
+              repo-add \
+                --key "$GPG_FINGERPRINT" \
+                --remove \
+                x86_64/pytuna.db.tar.gz \
+                "$PKG"
 
-              rm -f x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.files.tar.gz.sig
+              rm -f \
+                x86_64/pytuna.db.tar.gz.sig \
+                x86_64/pytuna.files.tar.gz.sig
 
-              gpg --batch --yes --pinentry-mode loopback \
-                --passphrase "$GPG_PASSPHRASE" --default-key "$GPG_FINGERPRINT" \
-                --detach-sign --output x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.db.tar.gz
+              gpg \
+                --batch \
+                --yes \
+                --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --default-key "$GPG_FINGERPRINT" \
+                --detach-sign \
+                --output x86_64/pytuna.db.tar.gz.sig \
+                x86_64/pytuna.db.tar.gz
 
-              gpg --batch --yes --pinentry-mode loopback \
-                --passphrase "$GPG_PASSPHRASE" --default-key "$GPG_FINGERPRINT" \
-                --detach-sign --output x86_64/pytuna.files.tar.gz.sig x86_64/pytuna.files.tar.gz
+              gpg \
+                --batch \
+                --yes \
+                --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --default-key "$GPG_FINGERPRINT" \
+                --detach-sign \
+                --output x86_64/pytuna.files.tar.gz.sig \
+                x86_64/pytuna.files.tar.gz
 
               echo "==> Verificando assinatura do banco após repo-add..."
-              gpg --verify x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.db.tar.gz
-              gpg --verify x86_64/pytuna.files.tar.gz.sig x86_64/pytuna.files.tar.gz
+
+              gpg --verify \
+                x86_64/pytuna.db.tar.gz.sig \
+                x86_64/pytuna.db.tar.gz
+
+              gpg --verify \
+                x86_64/pytuna.files.tar.gz.sig \
+                x86_64/pytuna.files.tar.gz
 
               rm -f x86_64/*.old x86_64/*.old.sig
             '
 
       - name: Remove from pacman database with repo-remove
         if: inputs.action == 'remove'
+        shell: bash
         run: |
+          set -euo pipefail
+
           docker run --rm \
             -v "${{ github.workspace }}/repository:/repo" \
             -e GPG_PRIVATE_KEY="${{ secrets.GPG_PRIVATE_KEY }}" \
@@ -158,31 +261,58 @@ jobs:
             archlinux:latest \
             bash -c '
               set -euo pipefail
+
               pacman -Syu --noconfirm
               pacman -S --noconfirm pacman-contrib gnupg
 
               pacman-key --init
               pacman-key --populate archlinux
 
-              echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-              echo "${GPG_FINGERPRINT}:6:" | gpg --import-ownertrust
+              printf "%s\n" "$GPG_PRIVATE_KEY" |
+                gpg --batch --import
 
-              repo-remove --key "$GPG_FINGERPRINT" --remove \
-                x86_64/pytuna.db.tar.gz "${{ inputs.package_name }}"
+              printf "%s:6:\n" "$GPG_FINGERPRINT" |
+                gpg --import-ownertrust
 
-              rm -f x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.files.tar.gz.sig
+              repo-remove \
+                --key "$GPG_FINGERPRINT" \
+                --remove \
+                x86_64/pytuna.db.tar.gz \
+                "${{ inputs.package_name }}"
 
-              gpg --batch --yes --pinentry-mode loopback \
-                --passphrase "$GPG_PASSPHRASE" --default-key "$GPG_FINGERPRINT" \
-                --detach-sign --output x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.db.tar.gz
+              rm -f \
+                x86_64/pytuna.db.tar.gz.sig \
+                x86_64/pytuna.files.tar.gz.sig
 
-              gpg --batch --yes --pinentry-mode loopback \
-                --passphrase "$GPG_PASSPHRASE" --default-key "$GPG_FINGERPRINT" \
-                --detach-sign --output x86_64/pytuna.files.tar.gz.sig x86_64/pytuna.files.tar.gz
+              gpg \
+                --batch \
+                --yes \
+                --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --default-key "$GPG_FINGERPRINT" \
+                --detach-sign \
+                --output x86_64/pytuna.db.tar.gz.sig \
+                x86_64/pytuna.db.tar.gz
+
+              gpg \
+                --batch \
+                --yes \
+                --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --default-key "$GPG_FINGERPRINT" \
+                --detach-sign \
+                --output x86_64/pytuna.files.tar.gz.sig \
+                x86_64/pytuna.files.tar.gz
 
               echo "==> Verificando assinatura do banco após repo-remove..."
-              gpg --verify x86_64/pytuna.db.tar.gz.sig x86_64/pytuna.db.tar.gz
-              gpg --verify x86_64/pytuna.files.tar.gz.sig x86_64/pytuna.files.tar.gz
+
+              gpg --verify \
+                x86_64/pytuna.db.tar.gz.sig \
+                x86_64/pytuna.db.tar.gz
+
+              gpg --verify \
+                x86_64/pytuna.files.tar.gz.sig \
+                x86_64/pytuna.files.tar.gz
 
               rm -f x86_64/*.old x86_64/*.old.sig
             '
@@ -190,44 +320,164 @@ jobs:
       - name: Remove leftover package files from disk
         if: inputs.action == 'remove'
         working-directory: repository/x86_64
+        shell: bash
         run: |
+          set -euo pipefail
           shopt -s nullglob
-          for f in "${{ inputs.package_name }}"-*.pkg.tar.zst "${{ inputs.package_name }}"-*.pkg.tar.zst.sig; do
-            echo "Removendo arquivo órfão: $f"
-            rm -f "$f"
+
+          for file in \
+            "${{ inputs.package_name }}"-*.pkg.tar.zst \
+            "${{ inputs.package_name }}"-*.pkg.tar.zst.sig
+          do
+            echo "Removendo arquivo órfão: $file"
+            rm -f -- "$file"
           done
 
       - name: Replace symlinks with real files
         working-directory: repository/x86_64
+        shell: bash
         run: |
-          for link in pytuna.db pytuna.files pytuna.db.sig pytuna.files.sig; do
+          set -euo pipefail
+
+          for link in \
+            pytuna.db \
+            pytuna.files \
+            pytuna.db.sig \
+            pytuna.files.sig
+          do
             if [ -L "$link" ]; then
-              target=$(readlink "$link")
-              rm "$link"
-              cp "$target" "$link"
+              target="$(readlink "$link")"
+              rm -- "$link"
+              cp -- "$target" "$link"
               echo "Resolvido: $link -> cópia real de $target"
             fi
           done
 
       - name: Verify final db/sig pair before commit
         working-directory: repository/x86_64
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_FINGERPRINT: ${{ secrets.GPG_FINGERPRINT }}
         run: |
-          gpg --import <(echo "${{ secrets.GPG_PRIVATE_KEY }}") 2>/dev/null || true
-          echo "${{ secrets.GPG_FINGERPRINT }}:6:" | gpg --import-ownertrust 2>/dev/null || true
+          set -euo pipefail
+
+          printf '%s\n' "$GPG_PRIVATE_KEY" |
+            gpg --batch --import 2>/dev/null || true
+
+          printf '%s:6:\n' "$GPG_FINGERPRINT" |
+            gpg --import-ownertrust 2>/dev/null || true
+
           echo "==> Verificação final antes do commit..."
-          gpg --verify pytuna.db.tar.gz.sig pytuna.db.tar.gz
-          gpg --verify pytuna.files.tar.gz.sig pytuna.files.tar.gz
+
+          gpg --verify \
+            pytuna.db.tar.gz.sig \
+            pytuna.db.tar.gz
+
+          gpg --verify \
+            pytuna.files.tar.gz.sig \
+            pytuna.files.tar.gz
 
       - name: Commit and push to repository
         working-directory: repository
+        shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "github-actions[bot]@users.noreply.github.com"
+
           git add x86_64
+
           if [ "${{ inputs.action }}" = "build" ]; then
             MSG="Update ${{ inputs.package_name }} (${{ steps.locate.outputs.pkg_basename }})"
           else
             MSG="Remove ${{ inputs.package_name }} from repository"
           fi
-          git commit -m "$MSG" || echo "Nada para commitar"
-          git push origin HEAD
+
+          if git diff --cached --quiet; then
+            echo "Nada para commitar"
+          else
+            git commit -m "$MSG"
+            git push origin HEAD
+          fi
+
+      - name: Configure SourceForge SSH
+        shell: bash
+        env:
+          SOURCEFORGE_SSH_PRIVATE_KEY: ${{ secrets.SOURCEFORGE_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SOURCEFORGE_SSH_PRIVATE_KEY" ]; then
+            echo "::error::O secret SOURCEFORGE_SSH_PRIVATE_KEY está vazio"
+            exit 1
+          fi
+
+          install -d -m 700 "$HOME/.ssh"
+
+          printf '%s\n' "$SOURCEFORGE_SSH_PRIVATE_KEY" \
+            > "$HOME/.ssh/pytunaos_sourceforge"
+
+          chmod 600 "$HOME/.ssh/pytunaos_sourceforge"
+
+          ssh-keyscan -H frs.sourceforge.net \
+            >> "$HOME/.ssh/known_hosts"
+
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Create SourceForge architecture directory
+        shell: bash
+        env:
+          SOURCEFORGE_USERNAME: ${{ secrets.SOURCEFORGE_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SOURCEFORGE_USERNAME" ]; then
+            echo "::error::O secret SOURCEFORGE_USERNAME está vazio"
+            exit 1
+          fi
+
+          REMOTE_DIRECTORY="/home/frs/project/pytunaos-pkg-repo/x86_64"
+
+          printf '%s\n' \
+            "-mkdir ${REMOTE_DIRECTORY}" \
+            "quit" |
+            sftp \
+              -b - \
+              -i "$HOME/.ssh/pytunaos_sourceforge" \
+              -o IdentitiesOnly=yes \
+              "${SOURCEFORGE_USERNAME}@frs.sourceforge.net"
+
+      - name: Mirror package repository to SourceForge
+        shell: bash
+        env:
+          SOURCEFORGE_USERNAME: ${{ secrets.SOURCEFORGE_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          LOCAL_DIRECTORY="${{ github.workspace }}/repository/x86_64/"
+          REMOTE_DIRECTORY="/home/frs/project/pytunaos-pkg-repo/x86_64/"
+
+          test -d "$LOCAL_DIRECTORY"
+          test -s "${LOCAL_DIRECTORY}/pytuna.db.tar.gz"
+          test -s "${LOCAL_DIRECTORY}/pytuna.db.tar.gz.sig"
+          test -s "${LOCAL_DIRECTORY}/pytuna.files.tar.gz"
+          test -s "${LOCAL_DIRECTORY}/pytuna.files.tar.gz.sig"
+
+          rsync \
+            --archive \
+            --verbose \
+            --checksum \
+            --partial \
+            --progress \
+            --delete-after \
+            --delete-excluded \
+            --exclude=".gitkeep" \
+            -e "ssh -i $HOME/.ssh/pytunaos_sourceforge -o IdentitiesOnly=yes" \
+            "$LOCAL_DIRECTORY" \
+            "${SOURCEFORGE_USERNAME}@frs.sourceforge.net:${REMOTE_DIRECTORY}"
+
+          echo "SourceForge mirror synchronized:"
+          echo "https://sourceforge.net/projects/pytunaos-pkg-repo/files/x86_64/"
